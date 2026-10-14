@@ -1171,7 +1171,7 @@ func waitForFileLines(t *testing.T, path string, want int) {
 	t.Fatalf("timed out waiting for %d lines in %s", want, path)
 }
 
-func TestGoalRolloutLatestSnapshotWins(t *testing.T) {
+func TestGoalRolloutTerminalSnapshotOverridesActive(t *testing.T) {
 	for _, status := range []string{"blocked", "paused", "complete", "stalled", "usageLimited", "budgetLimited"} {
 		t.Run(status, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "rollout.jsonl")

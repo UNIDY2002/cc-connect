@@ -74,6 +74,9 @@ func New(opts map[string]any) (core.Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if goalAutoContinue && goalContinuationLimit == 0 {
+		slog.Warn("codex goal: unlimited automatic continuation enabled; set goal_max_continuations to a positive value to cap turns")
+	}
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
 	appServerURL = normalizeAppServerURL(appServerURL)

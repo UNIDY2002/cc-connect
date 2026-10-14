@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 )
@@ -39,6 +40,7 @@ func (cs *codexSession) refreshGoalStatusFromRollout() {
 	cs.contextMu.RUnlock()
 	home, err := resolveCodexHome(cs.extraEnv)
 	if err != nil {
+		slog.Warn("codex goal: unable to resolve CODEX_HOME; continuation disabled for this turn", "session_id", sessionID, "error", err)
 		return
 	}
 	path := findSessionFileInCodexHome(home, sessionID)
@@ -47,6 +49,7 @@ func (cs *codexSession) refreshGoalStatusFromRollout() {
 	}
 	status, known, err := readGoalStatusFromRollout(path)
 	if err != nil {
+		slog.Warn("codex goal: unable to read rollout; continuation disabled for this turn", "session_id", sessionID, "path", path, "error", err)
 		return
 	}
 	cs.contextMu.Lock()
