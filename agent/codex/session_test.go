@@ -1219,7 +1219,7 @@ func TestGoalContinuationResultAllowsImmediateNextSend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cs.Close()
+	defer func() { _ = cs.Close() }()
 	if err := cs.Send("first", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
