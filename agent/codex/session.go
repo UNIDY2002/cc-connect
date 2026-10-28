@@ -34,9 +34,6 @@ type codexSession struct {
 	cliExtraArgs           []string // extra args from cmd, prepended before exec args
 	extraEnv               []string
 	promptPreamble         string
-	goalAutoContinue       bool
-	goalContinuationPrompt string
-	goalContinuationLimit  int
 	events                 chan core.Event
 	threadID               atomic.Value // stores string — Codex thread_id
 	ctx                    context.Context
@@ -44,9 +41,15 @@ type codexSession struct {
 	wg                     sync.WaitGroup
 	alive                  atomic.Bool
 	turnInFlight           atomic.Bool
+	turnMu                 sync.Mutex
+	turnDone               chan struct{}
+	turnCompleted          bool // terminal event received; process may still hold the writer lock
 	closeOnce              sync.Once
 	cmdMu                  sync.Mutex
 	cmds                   map[*exec.Cmd]struct{}
+	goalAutoContinue       bool
+	goalContinuationPrompt string
+	goalContinuationLimit  int
 
 	pendingMsgs []string // buffered agent_message texts awaiting classification
 
@@ -143,15 +146,16 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 	if !cs.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
-	if !cs.turnInFlight.CompareAndSwap(false, true) {
-		return fmt.Errorf("codex session turn already in progress")
+	if err := cs.beginTurn(); err != nil {
+		return err
 	}
 	// The deferred cleanup reads started when Send returns, so setup failures
 	// release the guard while a launched process keeps it until readLoop exits.
 	started := false
 	defer func() {
 		if !started {
-			cs.turnInFlight.Store(false)
+			cs.endTurn()
+			cs.wg.Done()
 		}
 	}()
 
@@ -202,11 +206,57 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 	}
 	cs.addCmd(cmd)
 
-	cs.wg.Add(1)
 	go cs.readLoop(cmd, stdout, &stderrBuf)
 	started = true
 
 	return nil
+}
+
+// beginTurn rejects overlapping prompts while the model is working, but lets a
+// follow-up wait for a completed process to release the persisted thread writer.
+// The engine can receive EventResult before that process has actually exited.
+func (cs *codexSession) beginTurn() error {
+	for {
+		cs.turnMu.Lock()
+		if err := cs.ctx.Err(); err != nil {
+			cs.turnMu.Unlock()
+			return err
+		}
+		if !cs.turnInFlight.Load() {
+			// Reserve the process before releasing turnMu so Close cannot finish
+			// waiting (and close events) while this Send is still setting it up.
+			cs.wg.Add(1)
+			cs.turnInFlight.Store(true)
+			cs.turnDone = make(chan struct{})
+			cs.turnCompleted = false
+			cs.turnMu.Unlock()
+			return nil
+		}
+		if !cs.turnCompleted {
+			cs.turnMu.Unlock()
+			return fmt.Errorf("codex session turn already in progress")
+		}
+		done := cs.turnDone
+		cs.turnMu.Unlock()
+		select {
+		case <-done:
+		case <-cs.ctx.Done():
+			return cs.ctx.Err()
+		}
+	}
+}
+
+func (cs *codexSession) endTurn() {
+	cs.turnMu.Lock()
+	defer cs.turnMu.Unlock()
+	cs.turnInFlight.Store(false)
+	close(cs.turnDone)
+}
+
+func (cs *codexSession) markTurnCompleted() {
+	cs.turnMu.Lock()
+	cs.turnCompleted = true
+	cs.turnMu.Unlock()
 }
 
 func (cs *codexSession) stageImages(prompt string, images []core.ImageAttachment) (string, []string, error) {
@@ -342,10 +392,8 @@ func codexImageExt(mime string) string {
 func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
 	defer cs.wg.Done()
 	defer func() {
+		defer cs.endTurn()
 		defer cs.removeCmd(cmd)
-		if !cs.goalAutoContinue {
-			defer cs.turnInFlight.Store(false)
-		}
 		if err := cmd.Wait(); err != nil {
 			stderrMsg := strings.TrimSpace(stderrBuf.String())
 			if stderrMsg != "" {
@@ -449,9 +497,7 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 		cs.handleItemCompleted(raw)
 
 	case "turn.completed":
-		if cs.goalAutoContinue {
-			cs.turnInFlight.Store(false)
-		}
+		cs.markTurnCompleted()
 		cs.refreshContextUsageFromRollout()
 		if cs.goalAutoContinue {
 			cs.refreshGoalStatusFromRollout()
@@ -465,9 +511,7 @@ func (cs *codexSession) handleEvent(raw map[string]any) {
 		}
 
 	case "turn.failed":
-		if cs.goalAutoContinue {
-			cs.turnInFlight.Store(false)
-		}
+		cs.markTurnCompleted()
 		errMsg := ""
 		if errObj, ok := raw["error"].(map[string]any); ok {
 			errMsg, _ = errObj["message"].(string)
@@ -957,8 +1001,10 @@ func (cs *codexSession) refreshContextUsageFromRollout() {
 }
 
 func (cs *codexSession) Close() error {
+	cs.turnMu.Lock()
 	cs.alive.Store(false)
 	cs.cancel()
+	cs.turnMu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		cs.wg.Wait()
